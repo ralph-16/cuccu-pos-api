@@ -18,8 +18,23 @@ const ordersRouter = require("./routes/orders.routes");
 const orderItemsRouter = require("./routes/orderItems.routes");
 const orderItemAddonsRouter = require("./routes/orderItemAddons.routes");
 const profilesRouter = require("./routes/profiles.routes");
+const paymentsRouter = require("./routes/payments.routes");
 
 const app = express();
+
+// Capture raw body ONLY for the PayMongo webhook route, before JSON
+// parsing consumes the stream. Required for HMAC signature verification —
+// any transformation of the body (even re-serializing identical JSON)
+// would break the signature check.
+app.use(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  (req, res, next) => {
+    req.rawBody = req.body.toString("utf8");
+    req.body = JSON.parse(req.rawBody);
+    next();
+  },
+);
 
 // --- Security & parsing middleware ---
 app.use(helmet());
@@ -67,6 +82,7 @@ app.use("/api/orders", ordersRouter);
 app.use("/api/order-items", orderItemsRouter);
 app.use("/api/order-item-addons", orderItemAddonsRouter);
 app.use("/api/profiles", profilesRouter);
+app.use("/api/payments", paymentsRouter);
 
 // --- 404 fallback ---
 app.use((req, res) => {
