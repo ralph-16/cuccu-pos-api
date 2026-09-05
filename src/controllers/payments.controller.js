@@ -110,30 +110,24 @@ async function handleWebhook(req, res, next) {
     const eventType = event?.data?.attributes?.type;
     const resource = event?.data?.attributes?.data;
 
-    // No user token exists here, so we use the anon client with no auth
-    // header for the payments lookup (allowed — payments SELECT policy
-    // requires a role, so this alone can't read/write without more).
-    // The actual DB mutation goes through our SECURITY DEFINER RPC,
-    // which runs with elevated privilege regardless of caller role.
     const { getAnonClient } = require("../config/supabase");
     const supabase = getAnonClient();
 
     if (eventType === "source.chargeable") {
       const sourceId = resource.id;
 
-      // Find our payment record by the PayMongo source id.
-      const { data: payment, error: findError } = await supabase
-        .from("payments")
-        .select("id, amount, order_id")
-        .eq("paymongo_source_id", sourceId)
-        .single();
+      const { data: payments, error: findError } = await supabase.rpc(
+        "find_payment_by_provider_id",
+        { p_source_id: sourceId },
+      );
+
+      const payment = payments?.[0];
 
       if (findError || !payment) {
         console.error("Webhook: no matching payment for source", sourceId);
-        return res.status(200).json({ received: true }); // ack anyway, nothing to retry
+        return res.status(200).json({ received: true });
       }
 
-      // Source is chargeable -> actually create the Payment (captures the money)
       const paymongoPayment = await createPayment({
         amount: Math.round(payment.amount * 100),
         sourceId,
@@ -150,11 +144,11 @@ async function handleWebhook(req, res, next) {
     if (eventType === "payment.paid") {
       const paymongoPaymentId = resource.id;
 
-      const { data: payment } = await supabase
-        .from("payments")
-        .select("id")
-        .eq("paymongo_payment_id", paymongoPaymentId)
-        .single();
+      const { data: payments } = await supabase.rpc(
+        "find_payment_by_provider_id",
+        { p_payment_id: paymongoPaymentId },
+      );
+      const payment = payments?.[0];
 
       if (payment) {
         await supabase.rpc("update_payment_status", {
@@ -167,11 +161,11 @@ async function handleWebhook(req, res, next) {
     if (eventType === "payment.failed") {
       const paymongoPaymentId = resource.id;
 
-      const { data: payment } = await supabase
-        .from("payments")
-        .select("id")
-        .eq("paymongo_payment_id", paymongoPaymentId)
-        .single();
+      const { data: payments } = await supabase.rpc(
+        "find_payment_by_provider_id",
+        { p_payment_id: paymongoPaymentId },
+      );
+      const payment = payments?.[0];
 
       if (payment) {
         await supabase.rpc("update_payment_status", {
@@ -181,7 +175,6 @@ async function handleWebhook(req, res, next) {
       }
     }
 
-    // Always acknowledge receipt quickly — PayMongo retries if we don't 200.
     res.status(200).json({ received: true });
   } catch (err) {
     next(err);
