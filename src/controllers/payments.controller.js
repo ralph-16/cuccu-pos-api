@@ -57,30 +57,43 @@ async function initiatePayment(req, res, next) {
 /**
  * Verifies PayMongo's HMAC signature on the raw request body.
  * See: https://developers.paymongo.com/docs/securing-webhook
+ *
+ * Hardened to NEVER throw — any malformed header, missing secret, or
+ * crypto error must resolve to "invalid signature" (false), not crash
+ * the request into an unhandled 500. A webhook endpoint that can be
+ * crashed by a malformed header is itself a minor DoS/availability risk,
+ * so failing closed here matters as much as the comparison itself.
  */
 function verifyWebhookSignature(rawBody, signatureHeader, secret) {
-  if (!signatureHeader) return false;
+  try {
+    if (!signatureHeader || !secret) return false;
 
-  const parts = Object.fromEntries(
-    signatureHeader.split(",").map((part) => part.split("=")),
-  );
+    const parts = Object.fromEntries(
+      signatureHeader.split(",").map((part) => part.split("="))
+    );
 
-  const { t: timestamp, te: testSig, li: liveSig } = parts;
-  const expectedSig = testSig || liveSig; // test mode during development
+    const { t: timestamp, te: testSig, li: liveSig } = parts;
+    const expectedSig = testSig || liveSig; // test mode during development
 
-  if (!timestamp || !expectedSig) return false;
+    if (!timestamp || !expectedSig) return false;
 
-  const signedPayload = `${timestamp}.${rawBody}`;
-  const computedSig = crypto
-    .createHmac("sha256", secret)
-    .update(signedPayload)
-    .digest("hex");
+    const signedPayload = `${timestamp}.${rawBody}`;
+    const computedSig = crypto
+      .createHmac("sha256", secret)
+      .update(signedPayload)
+      .digest("hex");
 
-  // Timing-safe comparison — required per PayMongo's go-live checklist.
-  return crypto.timingSafeEqual(
-    Buffer.from(computedSig),
-    Buffer.from(expectedSig),
-  );
+    const computedBuf = Buffer.from(computedSig);
+    const expectedBuf = Buffer.from(expectedSig);
+
+    // timingSafeEqual throws if buffer lengths differ — guard explicitly
+    // rather than letting a mismatched/truncated signature crash the request.
+    if (computedBuf.length !== expectedBuf.length) return false;
+
+    return crypto.timingSafeEqual(computedBuf, expectedBuf);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -99,7 +112,7 @@ async function handleWebhook(req, res, next) {
     const isValid = verifyWebhookSignature(
       req.rawBody,
       signature,
-      process.env.PAYMONGO_WEBHOOK_SECRET,
+      process.env.PAYMONGO_WEBHOOK_SECRET
     );
 
     if (!isValid) {
@@ -118,7 +131,7 @@ async function handleWebhook(req, res, next) {
 
       const { data: payments, error: findError } = await supabase.rpc(
         "find_payment_by_provider_id",
-        { p_source_id: sourceId },
+        { p_source_id: sourceId }
       );
 
       const payment = payments?.[0];
@@ -146,7 +159,7 @@ async function handleWebhook(req, res, next) {
 
       const { data: payments } = await supabase.rpc(
         "find_payment_by_provider_id",
-        { p_payment_id: paymongoPaymentId },
+        { p_payment_id: paymongoPaymentId }
       );
       const payment = payments?.[0];
 
@@ -163,7 +176,7 @@ async function handleWebhook(req, res, next) {
 
       const { data: payments } = await supabase.rpc(
         "find_payment_by_provider_id",
-        { p_payment_id: paymongoPaymentId },
+        { p_payment_id: paymongoPaymentId }
       );
       const payment = payments?.[0];
 
@@ -175,6 +188,7 @@ async function handleWebhook(req, res, next) {
       }
     }
 
+    // Always acknowledge receipt quickly — PayMongo retries if we don't 200.
     res.status(200).json({ received: true });
   } catch (err) {
     next(err);

@@ -18,12 +18,14 @@ describe("Products CRUD", () => {
       password: process.env.TEST_OWNER_PASSWORD,
     });
     ownerToken = ownerLogin.body.access_token;
+    console.log("DEBUG owner login:", ownerLogin.status, JSON.stringify(ownerLogin.body).slice(0, 200));
 
     const cashierLogin = await request(app).post("/api/auth/login").send({
       email: process.env.TEST_CASHIER_EMAIL,
       password: process.env.TEST_CASHIER_PASSWORD,
     });
     cashierToken = cashierLogin.body.access_token;
+    console.log("DEBUG cashier login:", cashierLogin.status, JSON.stringify(cashierLogin.body).slice(0, 200));
   });
 
   afterAll(async () => {
@@ -40,6 +42,8 @@ describe("Products CRUD", () => {
     const res = await request(app)
       .get("/api/products")
       .set("Authorization", `Bearer ${cashierToken}`);
+
+    console.log("DEBUG products list:", res.status, JSON.stringify(res.body));
 
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.data)).toBe(true);
@@ -73,6 +77,8 @@ describe("Products CRUD", () => {
       .post("/api/products")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ category_id: 1, name: "Vitest Test Product" });
+
+    console.log("DEBUG create product:", res.status, JSON.stringify(res.body));
 
     expect(res.status).toBe(201);
     expect(res.body.data.name).toBe("Vitest Test Product");

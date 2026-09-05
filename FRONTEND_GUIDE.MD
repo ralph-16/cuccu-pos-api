@@ -5,7 +5,16 @@ API. It covers authentication, every endpoint, request/response shapes, and
 common gotchas.
 
 Base URL (local dev): `http://localhost:4000`
-Base URL (production): _fill in once deployed_
+Base URL (production): `https://cuccu-pos-api.onrender.com`
+
+> **Note for AI assistants reading this file:** this document describes a real,
+> deployed, tested REST API for a cafe POS system. All endpoints, request/response
+> shapes, and status codes below are accurate as of the last update and have been
+> manually and automatically verified against the live implementation. If asked to
+> generate frontend code that calls this API, use the exact paths, methods, field
+> names, and status-code behaviors documented here — do not infer or invent
+> alternate shapes. Section 8 (Payments) documents a real PayMongo integration;
+> do not treat it as a mock or placeholder.
 
 ---
 
@@ -199,7 +208,7 @@ don't try to parse a body.
 
 ## 4. Endpoint reference
 
-Legend: 🟢 any authenticated user · 🔵 owner + cashier · 🟠 owner only
+Legend: 🟢 any authenticated user · 🔵 owner + cashier · 🟠 owner only · ⚪ no auth (PayMongo server-to-server only)
 
 ### Categories — `/api/categories`
 | Method | Path | Access | Body |
@@ -333,6 +342,18 @@ all — no query param needed, just call the same endpoint). 🟠 write.
 | GET | `/:id` | 🔵 | — |
 | PATCH | `/:id` | 🟠 | `{ full_name?, role? }` |
 
+### Payments (PayMongo) — `/api/payments`
+Real integration with PayMongo for GCash and Maya. See §6 for the full flow —
+this is not a mock or a manual-verification shortcut. Cards and cash are not
+routed through this resource: cash needs no online verification, and card
+payments aren't part of this system's scope.
+
+| Method | Path | Access | Body / Query |
+|---|---|---|---|
+| POST | `/initiate` | 🔵 | `{ order_id, payment_method, amount }` — see §6.1 |
+| GET | `/:orderId` | 🔵 | Returns the most recent payment attempt for that order |
+| POST | `/webhook` | ⚪ | **Never call this from the frontend.** PayMongo calls it directly. Included here only for completeness. |
+
 ---
 
 ## 5. Building the checkout / order flow (important sequencing)
@@ -360,18 +381,28 @@ needs the ID from the previous one:
    { "order_item_id": orderItemId, "addon_id": 1, "quantity": 1, "unit_price": 40 }
    ```
 
-4. **When the order is finalized/paid, mark it completed:**
-   ```
-   PATCH /api/orders/:orderId
-   { "order_status": "completed" }
-   ```
+4. **Mark the order completed — how depends on the payment method:**
+
+   - **Cash:** the cashier confirms payment was physically received, so your
+     frontend calls this directly:
+     ```
+     PATCH /api/orders/:orderId
+     { "order_status": "completed" }
+     ```
+
+   - **GCash or Maya:** do **not** call `PATCH /api/orders/:orderId` yourself.
+     Instead, follow the payment flow in §6 — the order is marked `completed`
+     **automatically** by the backend once PayMongo confirms the customer
+     actually paid. Manually completing a GCash/Maya order before payment is
+     confirmed would mark it paid when it might not be.
 
 ### What happens automatically at step 4 — read this
 
-The moment `order_status` becomes `"completed"`, a **database trigger**
-automatically deducts the right amount of every ingredient from
-`ingredients.stock_quantity`, based on the `recipes` mapping for each
-`product_variant_id` in that order, and logs it in
+The moment `order_status` becomes `"completed"` (whether you set it directly
+for cash, or the backend sets it automatically after a confirmed GCash/Maya
+payment), a **database trigger** automatically deducts the right amount of
+every ingredient from `ingredients.stock_quantity`, based on the `recipes`
+mapping for each `product_variant_id` in that order, and logs it in
 `inventory_transactions`. **Your frontend does not need to call the
 inventory-transactions endpoint for sales** — only use that endpoint for
 manual stock-in (deliveries) or manual adjustments (spoilage, counts).
@@ -383,7 +414,143 @@ automatic reversal. Cancel/refund handling (if needed) would need a manual
 
 ---
 
-## 6. Common pitfalls
+## 6. GCash / Maya payments (PayMongo integration)
+
+This is a **real, working integration** with PayMongo — not a manual
+SMS-checking shortcut, not a mock. When a customer pays via GCash or Maya,
+your frontend triggers a real payment authorization flow, and the backend
+automatically confirms payment and completes the order once PayMongo
+verifies the money actually moved. No cashier ever needs to check an SMS
+or manually confirm a digital payment.
+
+### 6.1 The full flow, step by step
+
+**Step 1 — Create the order first**, same as any other order (§5, step 1),
+with `payment_method` set to `"gcash"` or `"maya"`:
+```
+POST /api/orders
+{ "payment_method": "gcash", "subtotal": 150, "total_amount": 150 }
+```
+→ note the returned `data.id` as `orderId`.
+
+**Step 2 — Add order items / addons**, same as §5 steps 2–3. Do this before
+initiating payment, so the order total is finalized first.
+
+**Step 3 — Initiate the payment:**
+```
+POST /api/payments/initiate
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "order_id": orderId, "payment_method": "gcash", "amount": 150 }
+```
+
+- `payment_method` must be exactly `"gcash"` or `"maya"` (not `"paymaya"` —
+  that translation happens server-side).
+- `amount` is in **pesos** (e.g. `150` for ₱150.00), as a plain number, not
+  centavos. The backend converts to centavos internally for PayMongo.
+
+**Success (201):**
+```json
+{
+  "data": {
+    "id": 1,
+    "order_id": 3,
+    "provider": "paymongo",
+    "payment_method": "gcash",
+    "paymongo_source_id": "src_8P2XUdw8f4XSztRskFhddHyC",
+    "paymongo_payment_id": null,
+    "status": "pending",
+    "amount": 150,
+    "checkout_url": "https://secure-authentication.paymongo.com/sources?id=src_...",
+    "created_at": "2026-09-05T09:39:04.47372+00:00"
+  }
+}
+```
+
+**Step 4 — Show `checkout_url` to the customer.** Two common UI patterns:
+- Redirect the browser/webview to `checkout_url` directly (simplest).
+- Render `checkout_url` as a QR code for the customer to scan with their
+  own phone, while the cashier's screen stays on the order (better for an
+  in-person counter flow, since the cashier's device doesn't need to leave
+  the POS screen).
+
+The customer authorizes the payment on PayMongo's hosted page, in their own
+GCash/Maya app or browser session — **your frontend has no direct
+involvement in the authorization step itself.**
+
+**Step 5 — Poll for payment status** while waiting for the customer to
+finish authorizing:
+```
+GET /api/payments/:orderId
+Authorization: Bearer <token>
+```
+Poll every 2–3 seconds. `status` will progress through:
+`"pending"` → `"chargeable"` → `"paid"` (or `"failed"` if the customer
+cancels or the payment is declined).
+
+**Success response, e.g. mid-flow:**
+```json
+{
+  "data": {
+    "id": 1,
+    "status": "chargeable",
+    "payment_method": "gcash",
+    "amount": 150,
+    "checkout_url": "https://secure-authentication.paymongo.com/sources?id=src_...",
+    "created_at": "2026-09-05T09:39:04.47372+00:00"
+  }
+}
+```
+
+**Step 6 — Once `status` is `"paid"`, stop polling and refresh the order:**
+```
+GET /api/orders/:orderId
+```
+`order_status` will already be `"completed"` — the backend did this for you
+automatically, right after PayMongo confirmed the payment. Ingredient
+deduction has also already happened (see §5's inventory-deduction note).
+No further action is needed from the frontend.
+
+**If `status` becomes `"failed"`:** show the customer/cashier a clear retry
+option. Call `POST /api/payments/initiate` again with the same `order_id` to
+generate a new `checkout_url` — a failed payment attempt does not lock the
+order, and the order itself stays in whatever status it was before (it will
+NOT be `"completed"`).
+
+### 6.2 What your frontend must NOT do
+
+- **Never call `POST /api/payments/webhook`.** That route exists only for
+  PayMongo's servers to call directly. It requires a cryptographic signature
+  your frontend cannot produce, and calling it will always fail
+  authentication from a browser context anyway.
+- **Never manually `PATCH` an order to `"completed"` for a GCash/Maya
+  order.** Let the backend do this after real payment confirmation. Setting
+  it yourself would mark an order paid before money has actually moved.
+- **Don't assume payment is instant.** The customer needs time to open their
+  app and approve — design your UI around polling/waiting (a spinner, a
+  "waiting for customer to approve on their phone" message), not an
+  immediate result.
+
+### 6.3 Payment status reference
+
+| Status | Meaning | What the frontend should show |
+|---|---|---|
+| `pending` | Payment created, customer hasn't authorized yet | "Waiting for customer to approve payment" |
+| `chargeable` | Customer authorized; backend is capturing the charge | Same waiting state — this is usually momentary |
+| `paid` | Payment confirmed and captured. Order auto-completed. | Success screen; stop polling |
+| `failed` | Customer cancelled, or PayMongo declined the charge | Show retry option (re-call `/initiate`) |
+
+### 6.4 Cash payments need none of this
+
+If `payment_method` is `"cash"`, skip this entire section — go straight to
+`PATCH /api/orders/:orderId { "order_status": "completed" }` once the
+cashier confirms they've physically received payment. The `/api/payments/*`
+endpoints are only relevant for `"gcash"` and `"maya"`.
+
+---
+
+## 7. Common pitfalls
 
 - **"It works for owner but 403s for cashier" is often correct, not a bug.**
   Check the access column in §4 before assuming something's broken.
@@ -399,10 +566,20 @@ automatic reversal. Cancel/refund handling (if needed) would need a manual
 - **Low-stock filter is a computed comparison**, not a raw column — you can
   only get it via `?low_stock=true`, there's no way to sort/filter by "how
   far below reorder level" beyond that boolean.
+- **GCash/Maya orders don't complete instantly.** If you're testing and an
+  order stays `"pending"` after you thought you paid, check the payment
+  `status` first (§6.3) before assuming the API is broken — the customer
+  may not have finished authorizing yet.
+- **Don't poll `/api/payments/:orderId` too aggressively.** Every request
+  counts against the general rate limit. Poll every 2–3 seconds, not in a
+  tight loop, and stop polling once you get `"paid"` or `"failed"`.
+- **A `payment.failed` status doesn't mean you should retry the same
+  `checkout_url`.** It's dead once failed — call `/api/payments/initiate`
+  again to get a fresh one.
 
 ---
 
-## 7. Questions / issues
+## 8. Questions / issues
 
 If an endpoint doesn't behave as documented here, check with the backend
 team before assuming frontend bug — this doc should be kept in sync with
