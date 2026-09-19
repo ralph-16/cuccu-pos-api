@@ -13,7 +13,7 @@ Base URL (production): `https://cuccu-pos-api.onrender.com`
 > manually and automatically verified against the live implementation. If asked to
 > generate frontend code that calls this API, use the exact paths, methods, field
 > names, and status-code behaviors documented here — do not infer or invent
-> alternate shapes. Section 8 (Payments) documents a real PayMongo integration;
+> alternate shapes. Section 6 (Payments) documents a real PayMongo integration;
 > do not treat it as a mock or placeholder.
 
 ---
