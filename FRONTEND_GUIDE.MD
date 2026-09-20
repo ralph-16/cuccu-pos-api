@@ -354,6 +354,16 @@ payments aren't part of this system's scope.
 | GET | `/:orderId` | 🔵 | Returns the most recent payment attempt for that order |
 | POST | `/webhook` | ⚪ | **Never call this from the frontend.** PayMongo calls it directly. Included here only for completeness. |
 
+### Reports — `/api/reports`
+🟠 **Owner-only.** Pre-aggregated statistics for the Owner Dashboard — computed
+in the database, so never fetch all orders and sum them client-side.
+
+| Method | Path | Access | Query |
+|---|---|---|---|
+| GET | `/sales-summary` | 🟠 | `?from=YYYY-MM-DD&to=YYYY-MM-DD` (both optional — defaults to today) |
+
+See §7 for the exact response shape and timezone behavior.
+
 ---
 
 ## 5. Building the checkout / order flow (important sequencing)
@@ -550,7 +560,57 @@ endpoints are only relevant for `"gcash"` and `"maya"`.
 
 ---
 
-## 7. Common pitfalls
+## 7. Sales summary report (Owner Dashboard)
+
+```
+GET /api/reports/sales-summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+Authorization: Bearer <token>   (owner only — cashiers get 403)
+```
+
+`from`/`to` are optional inclusive calendar dates. When omitted, the range is
+**today** — defined in the cafe's business timezone, **Asia/Manila (UTC+8)**,
+NOT the server's timezone and NOT UTC. The server always runs on UTC (Render),
+so a 7:00 AM Manila sale falls on the previous UTC day — the API already
+handles this for you. The response echoes back the resolved `from_date` /
+`to_date` so you can display exactly which window was used.
+
+`400` on malformed params: non-`YYYY-MM-DD` strings, impossible dates like
+`2026-02-30`, or `from` after `to`.
+
+**Success (200):**
+```json
+{
+  "data": {
+    "from_date": "2026-09-20",
+    "to_date": "2026-09-20",
+    "total_revenue": 4820.5,
+    "order_count": 37,
+    "revenue_by_payment_method": {
+      "cash": 3100,
+      "gcash": 1470.5,
+      "maya": 250
+    },
+    "average_order_value": 130.28378378378378
+  }
+}
+```
+
+Only orders with `order_status = "completed"` inside the window are counted.
+All three payment-method keys are **always present** (zero revenue shows as
+`0`, never a missing key or `null`). An empty window returns zeros with
+`order_count: 0` — handle that before dividing anything yourself.
+
+### 7.1 Money fields are numbers (like every other endpoint)
+
+All money fields here are plain JSON **numbers**, same as `total_amount` on
+orders and `amount` on payments — not strings. Use them in math directly.
+One caveat: `average_order_value` is full-precision (`total ÷ count`, e.g.
+`130.28378378378378`) — round for display in the frontend (e.g. `₱130.28`);
+the backend deliberately does not pre-round.
+
+---
+
+## 8. Common pitfalls
 
 - **"It works for owner but 403s for cashier" is often correct, not a bug.**
   Check the access column in §4 before assuming something's broken.
@@ -570,6 +630,11 @@ endpoints are only relevant for `"gcash"` and `"maya"`.
   order stays `"pending"` after you thought you paid, check the payment
   `status` first (§6.3) before assuming the API is broken — the customer
   may not have finished authorizing yet.
+- **Sales-summary money fields are numbers**, but `average_order_value` is
+  full-precision — round it yourself for display (§7.1).
+- **"Today" on the dashboard is Manila time.** `/api/reports/sales-summary`
+  with no params uses Asia/Manila (UTC+8) day boundaries — don't build your
+  own UTC-based date filter on top of it and double-filter the window.
 - **Don't poll `/api/payments/:orderId` too aggressively.** Every request
   counts against the general rate limit. Poll every 2–3 seconds, not in a
   tight loop, and stop polling once you get `"paid"` or `"failed"`.
@@ -579,7 +644,7 @@ endpoints are only relevant for `"gcash"` and `"maya"`.
 
 ---
 
-## 8. Questions / issues
+## 9. Questions / issues
 
 If an endpoint doesn't behave as documented here, check with the backend
 team before assuming frontend bug — this doc should be kept in sync with

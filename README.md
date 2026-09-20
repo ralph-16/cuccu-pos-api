@@ -193,6 +193,111 @@ You'll also need the `payments` table itself — see `find . -name "*.sql"` in
 this repo, or ask the team for the current migration file if it's not yet
 tracked in version control alongside the code.
 
+### 4b. Set up the sales summary report function
+
+The `GET /api/reports/sales-summary` endpoint (owner-only) delegates all
+aggregation to a `SECURITY DEFINER` Postgres function — same pattern as the
+payments functions above, and it must be created once via the Supabase SQL
+Editor too. Run:
+
+```sql
+-- Aggregated sales stats for the owner dashboard. Called by the API via
+-- supabase.rpc('get_sales_summary', { p_from_date, p_to_date }) through the
+-- per-user RLS client — NO secret key involved.
+--
+-- SECURITY DEFINER is required so the aggregate sees all orders (owners
+-- already can under RLS). Postgres grants EXECUTE to PUBLIC by default,
+-- which means a cashier JWT (or even the anon role) COULD invoke this
+-- function directly against Supabase's REST endpoint, bypassing this
+-- API's Express-level owner check — the in-function guard below closes
+-- that hole at the database layer: the caller's JWT must resolve to a
+-- profiles row with role = 'owner', or the function raises. (Same
+-- defense-in-depth idea as RLS itself.)
+--
+-- Day boundaries are computed in 'Asia/Manila' (the cafe's business
+-- timezone, UTC+8), NOT the server's timezone — Render runs the API on UTC,
+-- which would misfile morning sales into the previous day. Change the
+-- literal below if the business timezone ever changes.
+CREATE OR REPLACE FUNCTION public.get_sales_summary(
+    p_from_date date DEFAULT NULL,
+    p_to_date date DEFAULT NULL
+)
+RETURNS TABLE (
+    from_date date,
+    to_date date,
+    total_revenue numeric,
+    order_count bigint,
+    revenue_by_payment_method jsonb,
+    average_order_value numeric
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $func$
+DECLARE
+    v_from date;
+    v_to date;
+    v_today date := (now() AT TIME ZONE 'Asia/Manila')::date;
+BEGIN
+    v_from := COALESCE(p_from_date, v_today);
+    v_to := COALESCE(p_to_date, v_today);
+
+    -- Owner-only at the DATABASE layer, not just in Express middleware.
+    -- SECURITY DEFINER runs as the function owner, so this profiles lookup
+    -- sees all rows; the caller's auth.uid() decides whose profile it is.
+    IF NOT EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE id = auth.uid() AND role = 'owner'
+    ) THEN
+        RAISE EXCEPTION 'Only owners may call get_sales_summary';
+    END IF;
+
+    IF v_to < v_from THEN
+        RAISE EXCEPTION 'p_to_date must be on or after p_from_date';
+    END IF;
+
+    -- No GROUP BY: an aggregate without one always returns exactly ONE row,
+    -- even when the window matches zero orders (sums NULL -> COALESCE 0).
+    -- A GROUP BY version would return zero rows for an empty window and the
+    -- API would hand the frontend an array/empty instead of zeroed stats.
+    RETURN QUERY
+    WITH completed AS (
+        SELECT o.payment_method, o.total_amount
+        FROM public.orders o
+        WHERE o.order_status = 'completed'
+          AND (o.created_at AT TIME ZONE 'Asia/Manila')::date >= v_from
+          AND (o.created_at AT TIME ZONE 'Asia/Manila')::date <= v_to
+    ),
+    totals AS (
+        SELECT
+            COALESCE(sum(total_amount), 0)::numeric AS total_revenue,
+            count(*)::bigint AS order_count,
+            COALESCE(sum(total_amount) FILTER (WHERE payment_method = 'cash'), 0)::numeric AS cash_revenue,
+            COALESCE(sum(total_amount) FILTER (WHERE payment_method = 'gcash'), 0)::numeric AS gcash_revenue,
+            COALESCE(sum(total_amount) FILTER (WHERE payment_method = 'maya'), 0)::numeric AS maya_revenue,
+            COALESCE(sum(total_amount) / NULLIF(count(*), 0), 0)::numeric AS average_order_value
+        FROM completed
+    )
+    SELECT
+        v_from,
+        v_to,
+        t.total_revenue,
+        t.order_count,
+        jsonb_build_object(
+            'cash', t.cash_revenue,
+            'gcash', t.gcash_revenue,
+            'maya', t.maya_revenue
+        ),
+        t.average_order_value
+    FROM totals t;
+END;
+$func$;
+```
+
+No further grants are needed: the API calls this through the same
+per-user RLS client as everything else, and the in-function guard (not a
+grant) is what makes it owner-only.
+
 ### 5. PayMongo webhook setup
 
 1. PayMongo Dashboard (test mode) → Developers → Webhooks → Create Webhook
@@ -308,6 +413,7 @@ All routes except `/health`, `/api/auth/login`, `/api/auth/refresh`, and
 | Order Item Addons | `/api/order-item-addons` | owner, cashier | owner, cashier (delete: owner only) |
 | Profiles | `/api/profiles` | own profile (cashier), all (owner) | owner only |
 | Payments | `/api/payments` | owner, cashier | initiate: owner, cashier · webhook: PayMongo only (HMAC-verified, no user auth) |
+| Reports | `/api/reports` | owner only | owner only (read-only aggregate stats) |
 
 Standard CRUD verbs apply per resource: `GET /`, `GET /:id`, `POST /`,
 `PATCH /:id`, `DELETE /:id` (except where noted above, e.g. profiles has
@@ -319,6 +425,17 @@ Most list endpoints support filtering, e.g.:
 - `GET /api/product-variants?product_id=4`
 - `GET /api/ingredients?low_stock=true`
 - `GET /api/orders?status=completed`
+
+Report endpoints (owner-only) return pre-aggregated statistics:
+- `GET /api/reports/sales-summary` — revenue/order aggregates over completed orders, `?from=YYYY-MM-DD&to=YYYY-MM-DD` (defaults to today, **Asia/Manila time**; see the SQL function in "Setup" for the timezone rationale)
+
+```bash
+curl "http://localhost:4000/api/reports/sales-summary" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+
+curl "http://localhost:4000/api/reports/sales-summary?from=2026-09-01&to=2026-09-20" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
 
 For full request/response shapes on every endpoint, including the complete
 GCash/Maya payment flow, see `FRONTEND_GUIDE.md`.
@@ -349,6 +466,17 @@ GCash/Maya payment flow, see `FRONTEND_GUIDE.md`.
   bodies always use plain peso amounts (e.g. `150` for ₱150.00) — the
   centavo conversion happens internally in `src/config/paymongo.js` and is
   never something the frontend needs to handle.
+- **Report money values are JSON numbers**, matching every other money field
+  in this API (verified: PostgREST serializes `numeric` as a number here).
+  `revenue_by_payment_method` is a JSON object, so its numbers survive
+  losslessly; `average_order_value` is deliberately full-precision
+  (e.g. `130.28378378378378`) — round for display in the frontend.
+- **"Today" in reports means Asia/Manila, not server time.**
+  `/api/reports/sales-summary` without `from`/`to` uses day boundaries in the
+  cafe's business timezone (UTC+8), not the host's clock — Render runs on
+  UTC, which would otherwise misfile morning sales into the previous day.
+  The timezone lives as a single literal in the `get_sales_summary` SQL
+  function if it ever needs to change.
 
 ## Project structure
 
@@ -370,7 +498,8 @@ src/
 tests/
 ├── auth.test.mjs
 ├── products.test.mjs
-└── payments.test.mjs
+├── payments.test.mjs
+└── reports.test.mjs
 ```
 
 Note on `app.js`: the PayMongo webhook route needs the **raw, unparsed**

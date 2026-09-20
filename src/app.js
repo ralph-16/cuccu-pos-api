@@ -19,6 +19,7 @@ const orderItemsRouter = require("./routes/orderItems.routes");
 const orderItemAddonsRouter = require("./routes/orderItemAddons.routes");
 const profilesRouter = require("./routes/profiles.routes");
 const paymentsRouter = require("./routes/payments.routes");
+const reportsRouter = require("./routes/reports.routes");
 
 const app = express();
 
@@ -83,6 +84,7 @@ app.use("/api/order-items", orderItemsRouter);
 app.use("/api/order-item-addons", orderItemAddonsRouter);
 app.use("/api/profiles", profilesRouter);
 app.use("/api/payments", paymentsRouter);
+app.use("/api/reports", reportsRouter);
 
 // --- 404 fallback ---
 app.use((req, res) => {
