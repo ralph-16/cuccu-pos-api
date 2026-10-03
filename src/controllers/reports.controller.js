@@ -21,7 +21,21 @@ async function getSalesSummary(req, res, next) {
     });
 
     if (error) throw error;
-    res.status(200).json({ data });
+
+    // PostgREST serializes a RETURNS TABLE function as a JSON ARRAY. The
+    // function guarantees exactly one row (aggregates without GROUP BY
+    // always return one), so unwrap it to deliver the documented
+    // single-object contract instead of a one-element array.
+    const summary = Array.isArray(data) ? data[0] : data;
+
+    if (!summary) {
+      // Should be unreachable — means the function's shape changed.
+      const err = new Error("get_sales_summary returned no rows.");
+      err.status = 500;
+      throw err;
+    }
+
+    res.status(200).json({ data: summary });
   } catch (err) {
     next(err);
   }

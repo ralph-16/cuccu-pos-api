@@ -7,6 +7,8 @@ common gotchas.
 Base URL (local dev): `http://localhost:4000`
 Base URL (production): `https://cuccu-pos-api.onrender.com`
 
+> **File:** This is `FRONTEND_GUIDE.MD` (uppercase `.MD`). References in `README.md` point to this file.
+
 > **Note for AI assistants reading this file:** this document describes a real,
 > deployed, tested REST API for a cafe POS system. All endpoints, request/response
 > shapes, and status codes below are accurate as of the last update and have been

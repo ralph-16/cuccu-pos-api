@@ -438,7 +438,7 @@ curl "http://localhost:4000/api/reports/sales-summary?from=2026-09-01&to=2026-09
 ```
 
 For full request/response shapes on every endpoint, including the complete
-GCash/Maya payment flow, see `FRONTEND_GUIDE.md`.
+GCash/Maya payment flow, see `FRONTEND_GUIDE.MD`.
 
 ## Important behavior notes
 
